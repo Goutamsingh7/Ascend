@@ -7,7 +7,7 @@ import {
   Home, User, ScrollText, BarChart3, BookOpen, Trophy, Timer, Settings,
   Flame, Plus, X, Check, ChevronRight, Star, Menu, Sparkles,
   Brain, Dumbbell, Moon, Hammer, Users, Coins, Play, Pause, Square,
-  Trash2, Edit3,
+  Trash2, Edit3, Skull, Volume2, VolumeX,
 } from "lucide-react";
 
 /* ============================== DESIGN TOKENS ============================== */
@@ -190,8 +190,132 @@ function computeRank(player, stats) {
   return RANKS[idx];
 }
 
+/* ============================== SOUND ENGINE ============================== */
+// Small synthesized SFX via Web Audio — no external audio files, so nothing
+// to license or fail to load. Lazily creates its AudioContext on first use
+// (inside a click handler) to satisfy browser autoplay policies.
+const audioEngine = (() => {
+  let ctx;
+  const getCtx = () => {
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) ctx = new AC();
+    }
+    return ctx;
+  };
+  const tone = (freq, dur, type = "sine", vol = 0.16, delay = 0) => {
+    const ac = getCtx();
+    if (!ac) return;
+    if (ac.state === "suspended") ac.resume();
+    const t0 = ac.currentTime + delay;
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(vol, t0 + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain);
+    gain.connect(ac.destination);
+    osc.start(t0);
+    osc.stop(t0 + dur + 0.05);
+  };
+  return {
+    click: () => tone(660, 0.05, "square", 0.05),
+    xp: () => { tone(880, 0.12, "sine", 0.12); tone(1320, 0.12, "sine", 0.08, 0.04); },
+    quest: () => { tone(523.25, 0.09, "triangle", 0.15); tone(659.25, 0.09, "triangle", 0.13, 0.07); tone(784, 0.16, "triangle", 0.13, 0.14); },
+    levelUp: () => [523.25, 659.25, 784, 1046.5].forEach((f, i) => tone(f, 0.22, "sawtooth", 0.12, i * 0.09)),
+    achievement: () => { tone(784, 0.1, "sine", 0.15); tone(988, 0.1, "sine", 0.13, 0.08); tone(1318.5, 0.22, "sine", 0.14, 0.16); },
+    bossDefeat: () => [220, 330, 440, 660, 880].forEach((f, i) => tone(f, 0.3, "sawtooth", 0.1, i * 0.08)),
+  };
+})();
+
+/* ============================== WEEKLY BOSS ============================== */
+// A conceptual boss for the week, damaged by real completed activity. Losing
+// a week to the boss isn't punished — it just tries again, per the "no
+// shame-based failure" design principle.
+const BOSS_POOL = [
+  { name: "Procrastination", flavor: "It grows stronger every time you say \"later\".", color: C.rose },
+  { name: "Chaos", flavor: "Unstructured days feed it.", color: C.amber },
+  { name: "Distraction", flavor: "It thrives in half-finished tabs.", color: C.cyan },
+  { name: "Fatigue", flavor: "Every skipped rest gives it strength.", color: C.violetDim },
+  { name: "Inconsistency", flavor: "It waits for the days you almost show up.", color: C.violet },
+];
+function isoWeekKey(date = new Date()) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${weekNo}`;
+}
+function generateBoss(weekKey) {
+  const pick = BOSS_POOL[Math.floor(Math.random() * BOSS_POOL.length)];
+  const maxHp = 650;
+  return { ...pick, weekKey, maxHp, hp: maxHp, defeated: false };
+}
+
+/* ============================== ARCHETYPES ============================== */
+const ARCHETYPES = [
+  { id: "scholar", name: "Scholar", desc: "Masters of study and deep focus.", bonus: { INT: 4, DISC: 2 }, color: ATTR_META.INT.color, icon: Brain },
+  { id: "warrior", name: "Warrior", desc: "Forged through physical discipline.", bonus: { STR: 3, VIT: 3 }, color: ATTR_META.STR.color, icon: Dumbbell },
+  { id: "builder", name: "Builder", desc: "Turns ideas into shipped reality.", bonus: { DEX: 4, DISC: 2 }, color: ATTR_META.DEX.color, icon: Hammer },
+  { id: "strategist", name: "Strategist", desc: "Balanced growth across every domain.", bonus: { INT: 2, DISC: 2, SOC: 2 }, color: C.cyan, icon: ScrollText },
+  { id: "explorer", name: "Explorer", desc: "Driven by connection and momentum.", bonus: { SOC: 4, VIT: 2 }, color: C.amber, icon: Users },
+];
+
+/* ============================== PURE XP / ACHIEVEMENT LOGIC ============================== */
+// Pure functions (no side effects) so callers can decide what to do with the
+// result (toast, sound, floating number) after the state update is computed.
+function applyXPToState(s, baseXp, attrKey, sourceLabel) {
+  const ns = JSON.parse(JSON.stringify(s));
+  const p = ns.player;
+  const today = todayStr();
+  if (ns.settings.streaksEnabled && ns.lastCompletionDate !== today) {
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    if (ns.lastCompletionDate === yesterday) p.streak += 1; else p.streak = 1;
+    p.longestStreak = Math.max(p.longestStreak, p.streak);
+    ns.lastCompletionDate = today;
+  }
+  const streakBonus = ns.settings.streaksEnabled ? Math.min(0.5, p.streak * 0.02) : 0;
+  const totalXp = Math.round(baseXp * (1 + streakBonus));
+  p.xp += totalXp;
+  p.totalXp += totalXp;
+  if (attrKey) p.attributes[attrKey] = (p.attributes[attrKey] || 1) + Math.max(1, Math.round(totalXp / 40));
+
+  let leveledUp = false;
+  let need = xpForLevel(p.level);
+  while (p.xp >= need) {
+    p.xp -= need;
+    p.level += 1;
+    leveledUp = true;
+    need = xpForLevel(p.level);
+  }
+  p.rank = computeRank(p, ns.stats);
+  ns.xpLog = [...ns.xpLog, { date: today, xp: p.totalXp }].slice(-200);
+
+  let bossDefeatedNow = false;
+  let bossName = null;
+  if (ns.boss && !ns.boss.defeated) {
+    const dmg = Math.round(totalXp * 1.4);
+    ns.boss = { ...ns.boss, hp: Math.max(0, ns.boss.hp - dmg) };
+    if (ns.boss.hp <= 0) { ns.boss.defeated = true; bossDefeatedNow = true; bossName = ns.boss.name; }
+  }
+
+  return { state: ns, totalXp, leveledUp, newLevel: p.level, bossDefeatedNow, bossName };
+}
+function checkAchievementsPure(s) {
+  const unlocked = { ...s.achievementsUnlocked };
+  const newly = [];
+  for (const a of ACHIEVEMENTS) {
+    if (!unlocked[a.id] && a.check(s)) { unlocked[a.id] = true; newly.push(a); }
+  }
+  return { state: { ...s, achievementsUnlocked: unlocked }, newly };
+}
+
 function defaultState() {
   return {
+    onboarded: false,
     player: {
       name: "Player",
       level: 1,
@@ -212,8 +336,9 @@ function defaultState() {
     journal: [],
     xpLog: [],
     stats: { questsCompleted: 0, focusSessions: 0, focusMinutes: 0 },
-    settings: { streaksEnabled: true },
+    settings: { streaksEnabled: true, soundEnabled: true },
     lastCompletionDate: null,
+    boss: null,
   };
 }
 
@@ -226,7 +351,12 @@ async function loadState() {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...defaultState(), ...parsed };
+      const merged = { ...defaultState(), ...parsed };
+      // Any previously saved blob means this player already exists — even if
+      // it predates the onboarding flow, don't send a returning player
+      // through character creation again.
+      merged.onboarded = parsed.onboarded !== undefined ? parsed.onboarded : true;
+      return merged;
     }
   } catch (e) {
     /* no saved state yet, or storage unavailable */
@@ -248,7 +378,10 @@ export default function AscendApp() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
   const [levelUpFlash, setLevelUpFlash] = useState(null);
+  const [bursts, setBursts] = useState([]);
   const saveTimer = useRef(null);
+  const soundEnabledRef = useRef(true);
+  const lastCheckedWeek = useRef(null);
 
   useEffect(() => {
     loadState().then(setState);
@@ -261,96 +394,79 @@ export default function AscendApp() {
     return () => clearTimeout(saveTimer.current);
   }, [state]);
 
+  useEffect(() => {
+    soundEnabledRef.current = state?.settings?.soundEnabled ?? true;
+  }, [state?.settings?.soundEnabled]);
+
+  // Weekly boss lifecycle — spawn one on first launch, replace it when the
+  // ISO week rolls over. Guarded by a ref so it only evaluates once per week
+  // per session rather than on every state change.
+  useEffect(() => {
+    if (!state) return;
+    const wk = isoWeekKey();
+    if (lastCheckedWeek.current === wk) return;
+    lastCheckedWeek.current = wk;
+    if (!state.boss || state.boss.weekKey !== wk) {
+      const isFirst = !state.boss;
+      const newBoss = generateBoss(wk);
+      setState((prev) => (prev ? { ...prev, boss: newBoss } : prev));
+      pushToast(isFirst ? `WEEKLY BOSS — ${newBoss.name} awaits.` : `NEW WEEKLY BOSS — ${newBoss.name} has appeared.`, "boss");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
   const pushToast = useCallback((text, kind = "system") => {
     const id = uid();
     setToasts((t) => [...t, { id, text, kind }]);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
   }, []);
 
-  const checkAchievements = useCallback((s) => {
-    const newly = [];
-    const unlocked = { ...s.achievementsUnlocked };
-    for (const a of ACHIEVEMENTS) {
-      if (!unlocked[a.id] && a.check(s)) {
-        unlocked[a.id] = true;
-        newly.push(a);
-      }
+  const playSound = useCallback((name) => {
+    if (soundEnabledRef.current && audioEngine[name]) audioEngine[name]();
+  }, []);
+
+  const spawnBurst = useCallback((x, y, label, color) => {
+    const id = uid();
+    setBursts((b) => [...b, { id, x, y, label, color }]);
+    setTimeout(() => setBursts((b) => b.filter((it) => it.id !== id)), 900);
+  }, []);
+
+  // Shared "resolve an XP-granting action" flow: run the pure calculation,
+  // then fan out the side effects (toast, sound, level-up cinematic, boss
+  // defeat, achievement unlocks) exactly once per action.
+  const resolveXPResult = useCallback((result, sourceLabel) => {
+    pushToast(`+${result.totalXp} XP — ${sourceLabel}`, "xp");
+    playSound(result.leveledUp ? "levelUp" : "quest");
+    if (result.leveledUp) {
+      setLevelUpFlash(result.newLevel);
+      setTimeout(() => setLevelUpFlash(null), 2600);
     }
-    if (newly.length) {
-      newly.forEach((a) => pushToast(`ACHIEVEMENT UNLOCKED — ${a.name}`, "achievement"));
+    if (result.bossDefeatedNow) {
+      pushToast(`BOSS DEFEATED — ${result.bossName} has fallen.`, "boss");
+      playSound("bossDefeat");
     }
-    return { ...s, achievementsUnlocked: unlocked };
-  }, [pushToast]);
+  }, [pushToast, playSound]);
 
-  // Central XP award function used by quests, focus sessions, etc.
-  const awardXP = useCallback((baseXp, attrKey, sourceLabel) => {
+  const completeQuest = useCallback((questId, event) => {
+    const q = state?.quests.find((x) => x.id === questId);
+    if (!q || q.status === "completed") return;
+    const attr = CATEGORY_ATTR[q.category] || "DISC";
     setState((prev) => {
-      let s = JSON.parse(JSON.stringify(prev));
-      const p = s.player;
-
-      // streak handling
-      const today = todayStr();
-      if (s.settings.streaksEnabled && s.lastCompletionDate !== today) {
-        const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-        if (s.lastCompletionDate === yesterday) {
-          p.streak += 1;
-        } else {
-          p.streak = 1;
-        }
-        p.longestStreak = Math.max(p.longestStreak, p.streak);
-        s.lastCompletionDate = today;
-      }
-
-      const streakBonus = s.settings.streaksEnabled ? Math.min(0.5, p.streak * 0.02) : 0;
-      const totalXp = Math.round(baseXp * (1 + streakBonus));
-
-      p.xp += totalXp;
-      p.totalXp += totalXp;
-      if (attrKey) {
-        p.attributes[attrKey] = (p.attributes[attrKey] || 1) + Math.max(1, Math.round(totalXp / 40));
-      }
-
-      let leveledUp = false;
-      let need = xpForLevel(p.level);
-      while (p.xp >= need) {
-        p.xp -= need;
-        p.level += 1;
-        leveledUp = true;
-        need = xpForLevel(p.level);
-      }
-
-      p.rank = computeRank(p, s.stats);
-
-      s.xpLog = [...s.xpLog, { date: today, xp: p.totalXp }].slice(-200);
-
-      pushToast(`+${totalXp} XP — ${sourceLabel}`, "xp");
-      if (leveledUp) {
-        setLevelUpFlash(p.level);
-        setTimeout(() => setLevelUpFlash(null), 2600);
-      }
-
-      s = checkAchievements(s);
-      return s;
-    });
-  }, [pushToast, checkAchievements]);
-
-  const completeQuest = useCallback((questId) => {
-    setState((prev) => {
-      const q = prev.quests.find((x) => x.id === questId);
-      if (!q || q.status === "completed") return prev;
-      const next = {
+      const pq = prev.quests.find((x) => x.id === questId);
+      if (!pq || pq.status === "completed") return prev;
+      const withQuest = {
         ...prev,
         quests: prev.quests.map((x) => (x.id === questId ? { ...x, status: "completed", completedAt: todayStr() } : x)),
         stats: { ...prev.stats, questsCompleted: prev.stats.questsCompleted + 1 },
       };
-      return next;
+      const result = applyXPToState(withQuest, DIFFICULTY[q.difficulty].xp, attr, q.title);
+      const ach = checkAchievementsPure(result.state);
+      resolveXPResult(result, q.title);
+      ach.newly.forEach((a) => pushToast(`ACHIEVEMENT UNLOCKED — ${a.name}`, "achievement"));
+      return ach.state;
     });
-    const q = state.quests.find((x) => x.id === questId);
-    if (q) {
-      const attr = CATEGORY_ATTR[q.category] || "DISC";
-      awardXP(DIFFICULTY[q.difficulty].xp, attr, q.title);
-    }
-  }, [state, awardXP]);
+    if (event) spawnBurst(event.clientX, event.clientY, `+${DIFFICULTY[q.difficulty].xp} XP`, ATTR_META[attr].color);
+  }, [state, resolveXPResult, pushToast, spawnBurst]);
 
   const addQuest = useCallback((quest) => {
     setState((prev) => ({ ...prev, quests: [...prev.quests, { ...quest, id: uid(), status: "active", createdAt: todayStr() }] }));
@@ -364,17 +480,21 @@ export default function AscendApp() {
     setState((prev) => ({ ...prev, journal: [{ ...entry, id: uid(), date: new Date().toISOString() }, ...prev.journal] }));
   }, []);
 
-  const completeFocusSession = useCallback((minutes) => {
-    setState((prev) => ({
-      ...prev,
-      stats: {
-        ...prev.stats,
-        focusSessions: prev.stats.focusSessions + 1,
-        focusMinutes: prev.stats.focusMinutes + minutes,
-      },
-    }));
-    awardXP(Math.min(150, Math.round(minutes * 1.2)), "DISC", `${minutes}min Focus Session`);
-  }, [awardXP]);
+  const completeFocusSession = useCallback((minutes, event) => {
+    setState((prev) => {
+      const withStats = {
+        ...prev,
+        stats: { ...prev.stats, focusSessions: prev.stats.focusSessions + 1, focusMinutes: prev.stats.focusMinutes + minutes },
+      };
+      const xp = Math.min(150, Math.round(minutes * 1.2));
+      const result = applyXPToState(withStats, xp, "DISC", `${minutes}min Focus Session`);
+      const ach = checkAchievementsPure(result.state);
+      resolveXPResult(result, "Focus Session");
+      ach.newly.forEach((a) => pushToast(`ACHIEVEMENT UNLOCKED — ${a.name}`, "achievement"));
+      return ach.state;
+    });
+    if (event) spawnBurst(event.clientX, event.clientY, "FOCUS COMPLETE", C.cyan);
+  }, [resolveXPResult, pushToast, spawnBurst]);
 
   const updatePlayer = useCallback((patch) => {
     setState((prev) => ({ ...prev, player: { ...prev.player, ...patch } }));
@@ -384,10 +504,24 @@ export default function AscendApp() {
     setState((prev) => ({ ...prev, settings: { ...prev.settings, streaksEnabled: !prev.settings.streaksEnabled } }));
   }, []);
 
-  const resetAll = useCallback(() => {
-    const fresh = defaultState();
-    setState(fresh);
+  const toggleSound = useCallback(() => {
+    setState((prev) => ({ ...prev, settings: { ...prev.settings, soundEnabled: !prev.settings.soundEnabled } }));
   }, []);
+
+  const resetAll = useCallback(() => {
+    setState(defaultState());
+    lastCheckedWeek.current = null;
+  }, []);
+
+  const createCharacter = useCallback((name, archetypeId) => {
+    const arch = ARCHETYPES.find((a) => a.id === archetypeId) || ARCHETYPES[0];
+    setState((prev) => {
+      const attrs = { ...prev.player.attributes };
+      Object.entries(arch.bonus).forEach(([k, v]) => { attrs[k] = (attrs[k] || 1) + v; });
+      return { ...prev, onboarded: true, player: { ...prev.player, name: name || "Player", class: arch.name, attributes: attrs } };
+    });
+    playSound("quest");
+  }, [playSound]);
 
   if (!state) {
     return (
@@ -397,7 +531,7 @@ export default function AscendApp() {
     );
   }
 
-  const ctx = { state, setState, view, setView, pushToast, awardXP, completeQuest, addQuest, deleteQuest, addJournalEntry, completeFocusSession, updatePlayer, toggleStreaks, resetAll };
+  const ctx = { state, setState, view, setView, pushToast, playSound, spawnBurst, completeQuest, addQuest, deleteQuest, addJournalEntry, completeFocusSession, updatePlayer, toggleStreaks, toggleSound, resetAll };
 
   return (
     <div style={{ background: C.bgGrad, backgroundColor: C.bg, minHeight: "100vh", color: C.text, fontFamily: "Sora, sans-serif", position: "relative", overflowX: "hidden" }}>
@@ -412,30 +546,111 @@ export default function AscendApp() {
         @keyframes scanline { 0% { transform: translateY(-100%); } 100% { transform: translateY(100%); } }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(6px);} to { opacity:1; transform: translateY(0);} }
         @keyframes levelBurst { 0% { opacity: 0; transform: scale(0.7);} 15% { opacity: 1; transform: scale(1.02);} 85% { opacity: 1; } 100% { opacity: 0; transform: scale(1.05);} }
+        @keyframes burstRise { 0% { opacity: 0; transform: translate(-50%,-30%) scale(.8);} 15% { opacity: 1; transform: translate(-50%,-55%) scale(1.15);} 100% { opacity: 0; transform: translate(-50%,-140%) scale(1);} }
+        @keyframes flicker { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+        @keyframes cardGlow { 0%,100% { box-shadow: 0 0 0px transparent; } 50% { box-shadow: 0 0 22px -6px currentColor; } }
         .fadein { animation: fadeIn .35s ease both; }
         .particle { position: absolute; border-radius: 50%; background: ${C.violet}; opacity: 0.35; filter: blur(1px); }
+        .panel { transition: box-shadow .25s ease, transform .2s ease, border-color .25s ease; }
+        .panel:hover { box-shadow: 0 0 26px -12px ${C.violet}55; border-color: ${C.panelBorder2}; }
+        button { transition: transform .12s ease, filter .12s ease, box-shadow .12s ease, background .15s ease, border-color .15s ease; }
+        button:active:not(:disabled) { transform: scale(0.94); }
+        button:disabled { cursor: not-allowed; }
       `}</style>
 
       <BackgroundAtmosphere />
-      {levelUpFlash && <LevelUpOverlay level={levelUpFlash} />}
-      <ToastStack toasts={toasts} />
 
-      <div style={{ display: "flex", minHeight: "100vh" }}>
-        <SideNav view={view} setView={setView} player={state.player} />
-        <main style={{ flex: 1, padding: "28px 28px 100px", maxWidth: 1180, margin: "0 auto", width: "100%" }}>
-          <TopBar player={state.player} setMobileMenuOpen={setMobileMenuOpen} />
-          {view === "home" && <HomeView ctx={ctx} />}
-          {view === "character" && <CharacterView ctx={ctx} />}
-          {view === "quests" && <QuestsView ctx={ctx} />}
-          {view === "journal" && <JournalView ctx={ctx} />}
-          {view === "analytics" && <AnalyticsView ctx={ctx} />}
-          {view === "achievements" && <AchievementsView ctx={ctx} />}
-          {view === "focus" && <FocusView ctx={ctx} />}
-          {view === "settings" && <SettingsView ctx={ctx} />}
-        </main>
+      {!state.onboarded ? (
+        <CharacterCreation onCreate={createCharacter} />
+      ) : (
+        <>
+          {levelUpFlash && <LevelUpOverlay level={levelUpFlash} />}
+          <ToastStack toasts={toasts} />
+          <BurstLayer bursts={bursts} />
+
+          <div style={{ display: "flex", minHeight: "100vh" }}>
+            <SideNav view={view} setView={setView} player={state.player} />
+            <main style={{ flex: 1, padding: "28px 28px 100px", maxWidth: 1180, margin: "0 auto", width: "100%" }}>
+              <TopBar player={state.player} setMobileMenuOpen={setMobileMenuOpen} />
+              {view === "home" && <HomeView ctx={ctx} />}
+              {view === "character" && <CharacterView ctx={ctx} />}
+              {view === "quests" && <QuestsView ctx={ctx} />}
+              {view === "journal" && <JournalView ctx={ctx} />}
+              {view === "analytics" && <AnalyticsView ctx={ctx} />}
+              {view === "achievements" && <AchievementsView ctx={ctx} />}
+              {view === "focus" && <FocusView ctx={ctx} />}
+              {view === "settings" && <SettingsView ctx={ctx} />}
+            </main>
+          </div>
+
+          <MobileNav view={view} setView={setView} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================== CHARACTER CREATION ============================== */
+function CharacterCreation({ onCreate }) {
+  const [name, setName] = useState("");
+  const [selected, setSelected] = useState(null);
+  const canConfirm = name.trim().length > 0 && !!selected;
+
+  return (
+    <div className="fadein" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, position: "relative", zIndex: 5 }}>
+      <div style={{ maxWidth: 660, width: "100%" }}>
+        <div className="display" style={{ textAlign: "center", fontSize: 13, letterSpacing: 4, color: C.cyan, marginBottom: 8 }}>SYSTEM INITIALIZATION</div>
+        <div className="display" style={{ textAlign: "center", fontSize: 30, fontWeight: 700, marginBottom: 26 }}>CREATE YOUR CHARACTER</div>
+
+        <Panel style={{ marginBottom: 18 }}>
+          <SectionLabel icon={User}>PLAYER NAME</SectionLabel>
+          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Enter your name…" style={selectStyle} />
+        </Panel>
+
+        <SectionLabel icon={Sparkles}>CHOOSE YOUR ARCHETYPE</SectionLabel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 24 }}>
+          {ARCHETYPES.map((a) => {
+            const Icon = a.icon;
+            const active = selected === a.id;
+            return (
+              <button key={a.id} onClick={() => setSelected(a.id)} style={{
+                textAlign: "left", padding: 16, borderRadius: 12,
+                background: active ? `${a.color}18` : C.panel,
+                border: `1px solid ${active ? a.color : C.panelBorder}`,
+                boxShadow: active ? `0 0 26px -8px ${a.color}` : "none",
+              }}>
+                <Icon size={20} color={a.color} style={{ marginBottom: 8 }} />
+                <div className="display" style={{ fontWeight: 700, fontSize: 15, marginBottom: 4 }}>{a.name}</div>
+                <div style={{ fontSize: 11.5, color: C.textDim, marginBottom: 8 }}>{a.desc}</div>
+                <div style={{ fontSize: 10, color: a.color, letterSpacing: 1 }}>
+                  {Object.entries(a.bonus).map(([k, v]) => `+${v} ${k}`).join("   ")}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        <button disabled={!canConfirm} onClick={() => canConfirm && onCreate(name.trim(), selected)} style={{
+          width: "100%", padding: 14, borderRadius: 10, border: "none",
+          background: canConfirm ? C.violet : C.panelBorder, color: canConfirm ? "#0A0A12" : C.textFaint,
+          fontFamily: "Rajdhani", fontWeight: 700, fontSize: 16, letterSpacing: 2,
+        }}>BEGIN ASCENSION</button>
       </div>
+    </div>
+  );
+}
 
-      <MobileNav view={view} setView={setView} />
+/* ============================== FLOATING BURST EFFECTS ============================== */
+function BurstLayer({ bursts }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, pointerEvents: "none", zIndex: 70 }}>
+      {bursts.map((b) => (
+        <div key={b.id} style={{
+          position: "absolute", left: b.x, top: b.y, transform: "translate(-50%,-50%)",
+          color: b.color, fontFamily: "Rajdhani", fontWeight: 700, fontSize: 14,
+          textShadow: `0 0 12px ${b.color}`, animation: "burstRise .9s ease-out forwards", whiteSpace: "nowrap",
+        }}>{b.label}</div>
+      ))}
     </div>
   );
 }
@@ -549,7 +764,9 @@ function TopBar({ player }) {
         <XPBar pct={pct} />
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.amber }}>
-        <Flame size={18} fill={player.streak > 0 ? C.amber : "none"} />
+        <span style={{ display: "flex", animation: player.streak > 0 ? "flicker 1.8s ease-in-out infinite" : "none" }}>
+          <Flame size={18} fill={player.streak > 0 ? C.amber : "none"} />
+        </span>
         <span className="display" style={{ fontWeight: 700, fontSize: 16 }}>{player.streak}</span>
       </div>
     </div>
@@ -571,7 +788,7 @@ function XPBar({ pct, color = C.violet }) {
 /* ============================== PANEL PRIMITIVE ============================== */
 function Panel({ children, style, glow }) {
   return (
-    <div style={{
+    <div className="panel" style={{
       background: C.panel, border: `1px solid ${C.panelBorder}`, borderRadius: 12,
       padding: 20, position: "relative", overflow: "hidden",
       boxShadow: glow ? `0 0 30px -10px ${glow}` : "none",
@@ -635,6 +852,7 @@ function HomeView({ ctx }) {
 
   return (
     <div className="fadein">
+      <BossPanel boss={state.boss} />
       <Panel glow={C.violet + "33"} style={{ marginBottom: 20, padding: 26 }}>
         <div className="display" style={{ fontSize: 12, color: C.cyan, letterSpacing: 3, marginBottom: 6 }}>SYSTEM INITIALIZED</div>
         <div className="display" style={{ fontSize: 24, fontWeight: 700, marginBottom: 4 }}>
@@ -691,6 +909,32 @@ function EmptyHint({ text }) {
   return <div style={{ color: C.textFaint, fontSize: 12.5, fontStyle: "italic", padding: "8px 0" }}>{text}</div>;
 }
 
+function BossPanel({ boss }) {
+  if (!boss) return null;
+  const pct = Math.max(0, Math.min(100, (boss.hp / boss.maxHp) * 100));
+  return (
+    <Panel glow={boss.color + "33"} style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <SectionLabel icon={Skull}>WEEKLY BOSS</SectionLabel>
+        <span style={{ fontSize: 10, color: C.textFaint }}>{boss.weekKey}</span>
+      </div>
+      <div className="display" style={{ fontSize: 20, fontWeight: 700, color: boss.color, marginBottom: 4 }}>
+        {boss.defeated ? `${boss.name} — DEFEATED` : boss.name}
+      </div>
+      <div style={{ fontSize: 12, color: C.textDim, marginBottom: 12, fontStyle: "italic" }}>{boss.flavor}</div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.textFaint, marginBottom: 4 }}>
+        <span>HP</span><span>{boss.hp} / {boss.maxHp}</span>
+      </div>
+      <XPBar pct={pct} color={boss.defeated ? C.cyan : boss.color} />
+      {boss.defeated ? (
+        <div style={{ marginTop: 10, fontSize: 11, color: C.cyan }}>A new challenger appears next week.</div>
+      ) : (
+        <div style={{ marginTop: 10, fontSize: 11, color: C.textFaint }}>Every completed quest and focus session damages this boss.</div>
+      )}
+    </Panel>
+  );
+}
+
 function QuestRow({ q, onComplete, onDelete }) {
   const attr = CATEGORY_ATTR[q.category] || "DISC";
   const meta = ATTR_META[attr];
@@ -701,7 +945,7 @@ function QuestRow({ q, onComplete, onDelete }) {
       background: done ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)",
       border: `1px solid ${C.panelBorder}`, marginBottom: 8, opacity: done ? 0.5 : 1,
     }}>
-      <button onClick={() => !done && onComplete(q.id)} disabled={done} style={{
+      <button onClick={(e) => !done && onComplete(q.id, e)} disabled={done} style={{
         width: 22, height: 22, borderRadius: 6, border: `1px solid ${done ? C.cyan : C.panelBorder2}`,
         background: done ? C.cyan + "22" : "transparent", display: "flex", alignItems: "center", justifyContent: "center",
         cursor: done ? "default" : "pointer", flexShrink: 0,
@@ -992,9 +1236,9 @@ function FocusView({ ctx }) {
   const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
   const ss = String(seconds % 60).padStart(2, "0");
 
-  const complete = () => {
+  const complete = (e) => {
     const minutes = Math.max(1, Math.round(seconds / 60));
-    completeFocusSession(minutes);
+    completeFocusSession(minutes, e);
     setRunning(false);
     setSeconds(0);
   };
@@ -1147,7 +1391,7 @@ function AchievementsView({ ctx }) {
 
 /* ============================== SETTINGS VIEW ============================== */
 function SettingsView({ ctx }) {
-  const { state, updatePlayer, toggleStreaks, resetAll } = ctx;
+  const { state, updatePlayer, toggleStreaks, toggleSound, resetAll } = ctx;
   const [confirmReset, setConfirmReset] = useState(false);
   return (
     <div className="fadein" style={{ maxWidth: 480 }}>
@@ -1162,6 +1406,15 @@ function SettingsView({ ctx }) {
           border: `1px solid ${C.panelBorder2}`, color: C.text, padding: "8px 14px", borderRadius: 8, cursor: "pointer",
         }}>
           {state.settings.streaksEnabled ? "Enabled — click to disable" : "Disabled — click to enable"}
+        </button>
+      </Panel>
+      <Panel style={{ marginBottom: 16 }}>
+        <SectionLabel icon={state.settings.soundEnabled ? Volume2 : VolumeX}>SOUND EFFECTS</SectionLabel>
+        <button onClick={toggleSound} style={{
+          display: "flex", alignItems: "center", gap: 8, background: "none",
+          border: `1px solid ${C.panelBorder2}`, color: C.text, padding: "8px 14px", borderRadius: 8, cursor: "pointer",
+        }}>
+          {state.settings.soundEnabled ? "Enabled — click to mute" : "Muted — click to enable"}
         </button>
       </Panel>
       <Panel>
