@@ -7,7 +7,7 @@ import {
   Home, User, ScrollText, BarChart3, BookOpen, Trophy, Timer, Settings,
   Flame, Plus, X, Check, ChevronRight, Star, Menu, Sparkles,
   Brain, Dumbbell, Moon, Hammer, Users, Coins, Play, Pause, Square,
-  Trash2, Edit3, Skull, Volume2, VolumeX,
+  Trash2, Edit3, Skull, Volume2, VolumeX, Gem,
 } from "lucide-react";
 
 /* ============================== DESIGN TOKENS ============================== */
@@ -277,11 +277,23 @@ function applyXPToState(s, baseXp, attrKey, sourceLabel) {
     p.longestStreak = Math.max(p.longestStreak, p.streak);
     ns.lastCompletionDate = today;
   }
+
+  // Daily combo: each completion today stacks a small extra XP bonus, on top
+  // of the streak bonus — capped so it rewards a productive day without
+  // letting XP run away. Resets automatically when the date changes.
+  if (!ns.dailyCombo || ns.dailyCombo.date !== today) ns.dailyCombo = { date: today, count: 0 };
+  ns.dailyCombo = { date: today, count: ns.dailyCombo.count + 1 };
+  const comboBonus = Math.min(0.4, (ns.dailyCombo.count - 1) * 0.04);
+
   const streakBonus = ns.settings.streaksEnabled ? Math.min(0.5, p.streak * 0.02) : 0;
-  const totalXp = Math.round(baseXp * (1 + streakBonus));
+  const totalXp = Math.round(baseXp * (1 + streakBonus + comboBonus));
   p.xp += totalXp;
   p.totalXp += totalXp;
   if (attrKey) p.attributes[attrKey] = (p.attributes[attrKey] || 1) + Math.max(1, Math.round(totalXp / 40));
+
+  // Gems — the currency spent on streak freezes (and future shop items).
+  const gemsEarned = Math.max(1, Math.round(totalXp / 12));
+  p.gems = (p.gems || 0) + gemsEarned;
 
   let leveledUp = false;
   let need = xpForLevel(p.level);
@@ -302,7 +314,7 @@ function applyXPToState(s, baseXp, attrKey, sourceLabel) {
     if (ns.boss.hp <= 0) { ns.boss.defeated = true; bossDefeatedNow = true; bossName = ns.boss.name; }
   }
 
-  return { state: ns, totalXp, leveledUp, newLevel: p.level, bossDefeatedNow, bossName };
+  return { state: ns, totalXp, gemsEarned, comboCount: ns.dailyCombo.count, leveledUp, newLevel: p.level, bossDefeatedNow, bossName };
 }
 function checkAchievementsPure(s) {
   const unlocked = { ...s.achievementsUnlocked };
@@ -311,6 +323,32 @@ function checkAchievementsPure(s) {
     if (!unlocked[a.id] && a.check(s)) { unlocked[a.id] = true; newly.push(a); }
   }
   return { state: { ...s, achievementsUnlocked: unlocked }, newly };
+}
+
+// Streak freezes: if the player has fully skipped one or more days since
+// their last completion, spend a freeze per missed day to keep the streak
+// alive (Duolingo's core retention mechanic). Runs once per app load, not
+// per completion, since it's resolving days the app was never opened.
+function resolveStreakGaps(s) {
+  if (!s.player.streak || !s.lastCompletionDate) return { state: s, notice: null };
+  const today = todayStr();
+  if (s.lastCompletionDate === today) return { state: s, notice: null };
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (s.lastCompletionDate === yesterday) return { state: s, notice: null };
+
+  const lastMs = new Date(s.lastCompletionDate + "T00:00:00Z").getTime();
+  const todayMs = new Date(today + "T00:00:00Z").getTime();
+  const missedDays = Math.round((todayMs - lastMs) / 86400000) - 1;
+  if (missedDays <= 0) return { state: s, notice: null };
+
+  const freezes = s.player.streakFreezes || 0;
+  if (freezes >= missedDays) {
+    const ns = { ...s, player: { ...s.player, streakFreezes: freezes - missedDays }, lastCompletionDate: yesterday };
+    const used = missedDays === 1 ? "a Streak Freeze" : `${missedDays} Streak Freezes`;
+    return { state: ns, notice: { text: `STREAK FREEZE — ${used} protected your ${s.player.streak}-day streak.`, kind: "boss" } };
+  }
+  const ns = { ...s, player: { ...s.player, streak: 0 } };
+  return { state: ns, notice: { text: "Your streak reset — a fresh run starts today.", kind: "system" } };
 }
 
 function defaultState() {
@@ -326,6 +364,8 @@ function defaultState() {
       streak: 0,
       longestStreak: 0,
       lastActiveDate: null,
+      gems: 20,
+      streakFreezes: 0,
       attributes: { STR: 1, INT: 1, VIT: 1, DEX: 1, DISC: 1, SOC: 1 },
     },
     quests: [
@@ -338,6 +378,7 @@ function defaultState() {
     stats: { questsCompleted: 0, focusSessions: 0, focusMinutes: 0 },
     settings: { streaksEnabled: true, soundEnabled: true },
     lastCompletionDate: null,
+    dailyCombo: { date: null, count: 0 },
     boss: null,
   };
 }
@@ -383,9 +424,23 @@ export default function AscendApp() {
   const soundEnabledRef = useRef(true);
   const lastCheckedWeek = useRef(null);
 
+  const [pendingNotice, setPendingNotice] = useState(null);
+
   useEffect(() => {
-    loadState().then(setState);
+    loadState().then((loaded) => {
+      const resolved = resolveStreakGaps(loaded);
+      setState(resolved.state);
+      if (resolved.notice) setPendingNotice(resolved.notice);
+    });
   }, []);
+
+  useEffect(() => {
+    if (pendingNotice) {
+      pushToast(pendingNotice.text, pendingNotice.kind);
+      setPendingNotice(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingNotice]);
 
   useEffect(() => {
     if (!state) return;
@@ -435,7 +490,7 @@ export default function AscendApp() {
   // then fan out the side effects (toast, sound, level-up cinematic, boss
   // defeat, achievement unlocks) exactly once per action.
   const resolveXPResult = useCallback((result, sourceLabel) => {
-    pushToast(`+${result.totalXp} XP — ${sourceLabel}`, "xp");
+    pushToast(`+${result.totalXp} XP · +${result.gemsEarned} 💎 — ${sourceLabel}`, "xp");
     playSound(result.leveledUp ? "levelUp" : "quest");
     if (result.leveledUp) {
       setLevelUpFlash(result.newLevel);
@@ -508,6 +563,18 @@ export default function AscendApp() {
     setState((prev) => ({ ...prev, settings: { ...prev.settings, soundEnabled: !prev.settings.soundEnabled } }));
   }, []);
 
+  const STREAK_FREEZE_COST = 150;
+  const STREAK_FREEZE_CAP = 2;
+  const buyStreakFreeze = useCallback(() => {
+    setState((prev) => {
+      const owned = prev.player.streakFreezes || 0;
+      if (owned >= STREAK_FREEZE_CAP || (prev.player.gems || 0) < STREAK_FREEZE_COST) return prev;
+      return { ...prev, player: { ...prev.player, gems: prev.player.gems - STREAK_FREEZE_COST, streakFreezes: owned + 1 } };
+    });
+    playSound("achievement");
+    pushToast("Streak Freeze purchased.", "system");
+  }, [playSound, pushToast]);
+
   const resetAll = useCallback(() => {
     setState(defaultState());
     lastCheckedWeek.current = null;
@@ -531,7 +598,7 @@ export default function AscendApp() {
     );
   }
 
-  const ctx = { state, setState, view, setView, pushToast, playSound, spawnBurst, completeQuest, addQuest, deleteQuest, addJournalEntry, completeFocusSession, updatePlayer, toggleStreaks, toggleSound, resetAll };
+  const ctx = { state, setState, view, setView, pushToast, playSound, spawnBurst, completeQuest, addQuest, deleteQuest, addJournalEntry, completeFocusSession, updatePlayer, toggleStreaks, toggleSound, resetAll, buyStreakFreeze, STREAK_FREEZE_COST, STREAK_FREEZE_CAP };
 
   return (
     <div style={{ background: C.bgGrad, backgroundColor: C.bg, minHeight: "100vh", color: C.text, fontFamily: "Sora, sans-serif", position: "relative", overflowX: "hidden" }}>
@@ -763,11 +830,20 @@ function TopBar({ player }) {
         </div>
         <XPBar pct={pct} />
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.amber }}>
-        <span style={{ display: "flex", animation: player.streak > 0 ? "flicker 1.8s ease-in-out infinite" : "none" }}>
-          <Flame size={18} fill={player.streak > 0 ? C.amber : "none"} />
-        </span>
-        <span className="display" style={{ fontWeight: 700, fontSize: 16 }}>{player.streak}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.cyan }}>
+          <Gem size={17} />
+          <span className="display" style={{ fontWeight: 700, fontSize: 16 }}>{player.gems ?? 0}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, color: C.amber }}>
+          <span style={{ display: "flex", animation: player.streak > 0 ? "flicker 1.8s ease-in-out infinite" : "none" }}>
+            <Flame size={18} fill={player.streak > 0 ? C.amber : "none"} />
+          </span>
+          <span className="display" style={{ fontWeight: 700, fontSize: 16 }}>{player.streak}</span>
+          {player.streakFreezes > 0 && (
+            <span title={`${player.streakFreezes} Streak Freeze(s) banked`} style={{ fontSize: 11, color: C.textFaint }}>❄×{player.streakFreezes}</span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -849,17 +925,35 @@ function HomeView({ ctx }) {
   const daily = state.quests.filter((q) => q.type === "daily");
   const active = state.quests.filter((q) => q.status === "active" && q.type !== "daily");
   const completedToday = state.quests.filter((q) => q.status === "completed" && q.completedAt === todayStr()).length;
+  const combo = state.dailyCombo && state.dailyCombo.date === todayStr() ? state.dailyCombo.count : 0;
+  const comboPct = Math.min(40, Math.max(0, (combo - 1) * 4));
 
   return (
     <div className="fadein">
       <BossPanel boss={state.boss} />
       <Panel glow={C.violet + "33"} style={{ marginBottom: 20, padding: 26 }}>
-        <div className="display" style={{ fontSize: 12, color: C.cyan, letterSpacing: 3, marginBottom: 6 }}>SYSTEM INITIALIZED</div>
-        <div className="display" style={{ fontSize: 24, fontWeight: 700, marginBottom: 4 }}>
-          "{state.player.title}" — {state.player.name}
-        </div>
-        <div style={{ color: C.textDim, fontSize: 13 }}>
-          {completedToday} quests completed today · Rank {state.player.rank} · Class {state.player.class}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div className="display" style={{ fontSize: 12, color: C.cyan, letterSpacing: 3, marginBottom: 6 }}>SYSTEM INITIALIZED</div>
+            <div className="display" style={{ fontSize: 24, fontWeight: 700, marginBottom: 4 }}>
+              "{state.player.title}" — {state.player.name}
+            </div>
+            <div style={{ color: C.textDim, fontSize: 13 }}>
+              {completedToday} quests completed today · Rank {state.player.rank} · Class {state.player.class}
+            </div>
+          </div>
+          {combo >= 2 && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 6, background: `${C.amber}18`,
+              border: `1px solid ${C.amber}55`, borderRadius: 20, padding: "6px 12px",
+              animation: "flicker 1.6s ease-in-out infinite",
+            }}>
+              <Flame size={14} color={C.amber} />
+              <span className="display" style={{ fontSize: 12, fontWeight: 700, color: C.amber }}>
+                COMBO ×{combo} · +{comboPct}% XP
+              </span>
+            </div>
+          )}
         </div>
       </Panel>
 
@@ -1391,13 +1485,32 @@ function AchievementsView({ ctx }) {
 
 /* ============================== SETTINGS VIEW ============================== */
 function SettingsView({ ctx }) {
-  const { state, updatePlayer, toggleStreaks, toggleSound, resetAll } = ctx;
+  const { state, updatePlayer, toggleStreaks, toggleSound, resetAll, buyStreakFreeze, STREAK_FREEZE_COST, STREAK_FREEZE_CAP } = ctx;
   const [confirmReset, setConfirmReset] = useState(false);
+  const owned = state.player.streakFreezes || 0;
+  const canBuy = owned < STREAK_FREEZE_CAP && (state.player.gems || 0) >= STREAK_FREEZE_COST;
   return (
     <div className="fadein" style={{ maxWidth: 480 }}>
       <Panel style={{ marginBottom: 16 }}>
         <SectionLabel icon={User}>PLAYER NAME</SectionLabel>
         <input value={state.player.name} onChange={(e) => updatePlayer({ name: e.target.value })} style={selectStyle} />
+      </Panel>
+      <Panel style={{ marginBottom: 16 }}>
+        <SectionLabel icon={Gem}>GEM SHOP</SectionLabel>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 13.5, fontWeight: 600 }}>Streak Freeze</div>
+            <div style={{ fontSize: 11.5, color: C.textDim }}>Auto-protects your streak if you miss a day. Owned: {owned}/{STREAK_FREEZE_CAP}</div>
+          </div>
+          <button onClick={buyStreakFreeze} disabled={!canBuy} style={{
+            display: "flex", alignItems: "center", gap: 6, flexShrink: 0,
+            background: canBuy ? `${C.cyan}22` : "transparent",
+            border: `1px solid ${canBuy ? C.cyan : C.panelBorder2}`,
+            color: canBuy ? C.cyan : C.textFaint, padding: "8px 14px", borderRadius: 8, fontWeight: 600, fontSize: 12.5,
+          }}>
+            <Gem size={13} /> {STREAK_FREEZE_COST}
+          </button>
+        </div>
       </Panel>
       <Panel style={{ marginBottom: 16 }}>
         <SectionLabel icon={Flame}>STREAK MECHANICS</SectionLabel>
