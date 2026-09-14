@@ -351,6 +351,23 @@ function resolveStreakGaps(s) {
   return { state: ns, notice: { text: "Your streak reset — a fresh run starts today.", kind: "system" } };
 }
 
+// Daily quests are meant to repeat every day — without this, a completed
+// daily just stays marked "completed" forever and never comes back. Resets
+// any daily quest whose completedAt isn't today back to active.
+function resetDailyQuests(s) {
+  const today = todayStr();
+  let resetCount = 0;
+  const quests = s.quests.map((q) => {
+    if (q.type === "daily" && q.status === "completed" && q.completedAt !== today) {
+      resetCount += 1;
+      return { ...q, status: "active", completedAt: null };
+    }
+    return q;
+  });
+  if (resetCount === 0) return { state: s, resetCount: 0 };
+  return { state: { ...s, quests }, resetCount };
+}
+
 function defaultState() {
   return {
     onboarded: false,
@@ -423,6 +440,7 @@ export default function AscendApp() {
   const saveTimer = useRef(null);
   const soundEnabledRef = useRef(true);
   const lastCheckedWeek = useRef(null);
+  const lastCheckedDay = useRef(null);
 
   const [pendingNotice, setPendingNotice] = useState(null);
 
@@ -467,6 +485,26 @@ export default function AscendApp() {
       setState((prev) => (prev ? { ...prev, boss: newBoss } : prev));
       pushToast(isFirst ? `WEEKLY BOSS — ${newBoss.name} awaits.` : `NEW WEEKLY BOSS — ${newBoss.name} has appeared.`, "boss");
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
+
+  // Daily quest reset — quests of type "daily" are meant to recur every day
+  // (that's what distinguishes them from a one-time main/side quest). Without
+  // this, a completed daily just stays marked completed forever. Runs once
+  // per calendar day per session, and immediately on load in case the day
+  // already rolled over while the app was closed.
+  useEffect(() => {
+    if (!state) return;
+    const today = todayStr();
+    if (lastCheckedDay.current === today) return;
+    lastCheckedDay.current = today;
+    setState((prev) => {
+      if (!prev) return prev;
+      const result = resetDailyQuests(prev);
+      if (result.resetCount === 0) return prev;
+      pushToast(`NEW DAY — ${result.resetCount} daily quest${result.resetCount > 1 ? "s" : ""} reset.`, "system");
+      return result.state;
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
